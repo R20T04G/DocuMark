@@ -1,0 +1,15 @@
+files.zip
+# Node/Next.js ignores
+node_modules/
+.next/
+out/
+.env
+
+# .NET ignores
+bin/
+obj/
+appsettings.Development.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
