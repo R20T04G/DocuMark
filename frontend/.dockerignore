@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+.DS_Store
+.git
+.gitignore
+.env
+.vscode/
+dist/
+build/
+**/node_modules

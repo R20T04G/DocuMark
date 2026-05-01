@@ -1,0 +1,11 @@
+# Ignore Next.js heavy folders
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Ignore .NET compiled folders
+backend/bin/
+backend/obj/
+
+# Ignore Git history
+.git/

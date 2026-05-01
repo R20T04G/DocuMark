@@ -13,3 +13,4 @@ appsettings.Development.json
 # OS generated files
 .DS_Store
 Thumbs.db
+.fake
