@@ -1,18 +1,19 @@
 name: DocuMark CI Pipeline
 
-# 1. THE TRIGGER: When does this run?
 on:
   push:
-    branches: [ "main" ] # Change to "master" if that is your default branch
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
-# 2. THE JOBS: What should the server do?
+# ADD THIS BLOCK to future-proof the runner engine
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-and-test:
-    # Spin up a fresh Linux server in the cloud
     runs-on: ubuntu-latest
-
+    
     steps:
     # Step A: Download your code onto the server
     - name: Checkout Code
