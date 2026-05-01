@@ -25,7 +25,6 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseCors(); 
-app.UseHttpsRedirection();
 
 // ==========================================
 // OUR UPDATED FILE UPLOAD ENDPOINT

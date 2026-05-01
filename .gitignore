@@ -1,16 +1,59 @@
+# Build artifacts
 files.zip
-# Node/Next.js ignores
+
+# ── Node.js / Next.js ──
 node_modules/
 .next/
 out/
-.env
+dist/
+build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
 
-# .NET ignores
+# ── .NET / Visual Studio ──
 bin/
 obj/
+.vs/
+.vscode/
+*.user
+*.csproj.user
+*.sln.user
+Properties/launchSettings.json
 appsettings.Development.json
+appsettings.*.json
 
-# OS generated files
+# ── Terraform ──
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ── Environment & Secrets ──
+.env
+.env.local
+.env.*.local
+.env.Development.local
+
+# ── IDE & Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+
+# ── Generated Files ──
 .fake
+.ionide
