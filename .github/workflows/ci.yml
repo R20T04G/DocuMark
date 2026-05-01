@@ -30,11 +30,11 @@ jobs:
       working-directory: ./backend
       run: dotnet build --configuration Release
 
-    # Step D: Install Node.js
-    - name: Setup Node.js 18
+    # Step D: Install Node.js (Next.js 16 requires >=20.9.0)
+    - name: Setup Node.js 20
       uses: actions/setup-node@v4
       with:
-        node-version: 18
+        node-version: 20.19.0
 
     # Step E: Prove the Next.js frontend builds without errors
     - name: Compile Frontend
@@ -45,4 +45,4 @@ jobs:
 
     # Step F: The Ultimate Test - Do the Docker containers still build?
     - name: Test Docker Orchestration
-      run: docker-compose build
+      run: docker compose build
