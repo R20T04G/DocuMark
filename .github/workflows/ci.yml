@@ -13,36 +13,39 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    
+
     steps:
-    # Step A: Download your code onto the server
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      # Step A: Download your code onto the server
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    # Step B: Install the .NET 8 SDK
-    - name: Setup .NET 8
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 8.0.x
+      # Step B: Install the .NET 8 SDK
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
-    # Step C: Prove the C# backend compiles without errors
-    - name: Compile Backend
-      working-directory: ./backend
-      run: dotnet build --configuration Release
+      # Step C: Prove the C# backend compiles without errors
+      - name: Compile Backend
+        working-directory: ./backend
+        run: dotnet build --configuration Release
 
-    # Step D: Install Node.js (Next.js 16 requires >=20.9.0)
-    - name: Setup Node.js 20
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20.19.0
+      # Step D: Install Node.js (Next.js 16 requires >=20.9.0)
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
-    # Step E: Prove the Next.js frontend builds without errors
-    - name: Compile Frontend
-      working-directory: ./frontend
-      run: |
-        npm install
-        npm run build
+      # Step E: Prove the Next.js frontend builds without errors
+      - name: Compile Frontend
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run build
 
-    # Step F: The Ultimate Test - Do the Docker containers still build?
-    - name: Test Docker Orchestration
-      run: docker compose build
+      # Step F: The Ultimate Test - Do the Docker containers still build?
+      - name: Test Docker Orchestration
+        run: docker compose build

@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Copy package files and install all dependencies (including dev tools)
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
 # Copy the rest of the code and compile the Next.js app
 COPY . .
@@ -14,4 +14,4 @@ RUN npm run build
 
 # Expose the port and start the compiled app
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["npm", "start", "--", "--hostname", "0.0.0.0", "--port", "3000"]

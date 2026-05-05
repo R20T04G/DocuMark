@@ -64,7 +64,7 @@ resource "aws_instance" "documark_server" {
               cd /home/ubuntu
               git clone https://github.com/R20T04G/DocuMark
               cd DocuMark
-              sudo docker-compose up -d
+              sudo docker-compose up -d --build
               EOF
 
   tags = {

@@ -1,12 +1,13 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using System.IO.Compression;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
 using DocumentFormat.OpenXml.Spreadsheet;
 using DocumentFormat.OpenXml.Wordprocessing;
 using A = DocumentFormat.OpenXml.Drawing;
-using System.Buffers.Binary;
 using System.Text;
+using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -35,7 +36,7 @@ app.UseCors();
 // ==========================================
 // DOCUMENT CONVERSION ENDPOINT
 // ==========================================
-app.MapPost("/api/convert", async (IFormFile? file) =>
+app.MapPost("/api/convert", async ([FromForm] IFormFile? file, [FromForm] string? outputFormat) =>
 {
     if (file == null || file.Length == 0)
     {
@@ -47,11 +48,17 @@ app.MapPost("/api/convert", async (IFormFile? file) =>
     await using var uploadedFile = new MemoryStream();
     await file.CopyToAsync(uploadedFile);
     var fileBytes = uploadedFile.ToArray();
+    var requestedOutputFormat = ParseRequestedOutputFormat(outputFormat);
+
+    if (requestedOutputFormat == OutputFormat.CsvBundle && extension != ".xlsx")
+    {
+        return Results.BadRequest("CSV bundle export is only available for Excel workbooks.");
+    }
 
     return extension switch
     {
         ".docx" => ConvertWordDocument(new MemoryStream(fileBytes), file.FileName),
-        ".xlsx" => ConvertSpreadsheet(new MemoryStream(fileBytes), file.FileName),
+        ".xlsx" => ConvertSpreadsheet(new MemoryStream(fileBytes), file.FileName, requestedOutputFormat),
         ".pptx" => ConvertPresentation(new MemoryStream(fileBytes), file.FileName),
         ".pdf" => ConvertPdf(new MemoryStream(fileBytes), file.FileName),
         _ => Results.BadRequest("Supported formats are .docx, .xlsx, .pptx, and .pdf.")
@@ -65,6 +72,11 @@ static IResult ConvertWordDocument(Stream stream, string fileName)
 {
     try
     {
+        if (stream.CanSeek)
+        {
+            stream.Position = 0;
+        }
+
         using var wordDocument = WordprocessingDocument.Open(stream, false);
         var body = wordDocument.MainDocumentPart?.Document.Body;
 
@@ -76,28 +88,43 @@ static IResult ConvertWordDocument(Stream stream, string fileName)
         var markdownBuilder = new StringBuilder();
         AppendConversionHeader(markdownBuilder, fileName, "Word document", new[]
         {
-            "- Conversion mode: paragraph extraction",
+            "- Conversion mode: structured paragraph and table extraction",
             "- Output format: Markdown",
-            "- AI-friendly structure: converted headings and paragraphs into readable text"
+            "- Headings, lists, and tables are preserved where the document styles expose them"
         });
 
-        foreach (var paragraph in body.Elements<Paragraph>())
+        foreach (var element in body.ChildElements)
         {
-            var text = paragraph.InnerText;
-            if (!string.IsNullOrWhiteSpace(text))
+            switch (element)
             {
-                markdownBuilder.AppendLine(text);
-                markdownBuilder.AppendLine();
+                case Paragraph paragraph:
+                {
+                    var paragraphMarkdown = RenderWordParagraph(paragraph);
+                    if (!string.IsNullOrWhiteSpace(paragraphMarkdown))
+                    {
+                        markdownBuilder.AppendLine(paragraphMarkdown);
+                        markdownBuilder.AppendLine();
+                    }
+
+                    break;
+                }
+                case DocumentFormat.OpenXml.Wordprocessing.Table table:
+                {
+                    var tableMarkdown = ConvertWordTable(table);
+                    if (!string.IsNullOrWhiteSpace(tableMarkdown))
+                    {
+                        markdownBuilder.AppendLine(tableMarkdown);
+                        markdownBuilder.AppendLine();
+                    }
+
+                    break;
+                }
             }
         }
 
         var markdown = markdownBuilder.ToString().TrimEnd();
 
-        return Results.Ok(new
-        {
-            message = "Conversion successful!",
-            markdown
-        });
+        return CreateMarkdownResult(fileName, "Word document", markdown, markdown);
     }
     catch (Exception ex)
     {
@@ -105,10 +132,15 @@ static IResult ConvertWordDocument(Stream stream, string fileName)
     }
 }
 
-static IResult ConvertSpreadsheet(Stream stream, string fileName)
+static IResult ConvertSpreadsheet(Stream stream, string fileName, OutputFormat outputFormat)
 {
     try
     {
+        if (stream.CanSeek)
+        {
+            stream.Position = 0;
+        }
+
         using var spreadsheetDocument = SpreadsheetDocument.Open(stream, false);
         var workbookPart = spreadsheetDocument.WorkbookPart;
 
@@ -117,15 +149,9 @@ static IResult ConvertSpreadsheet(Stream stream, string fileName)
             return Results.BadRequest("Could not read workbook sheets.");
         }
 
-        var markdownBuilder = new StringBuilder();
-        AppendConversionHeader(markdownBuilder, fileName, "Excel workbook", new[]
-        {
-            "- Conversion mode: worksheet table extraction",
-            "- Output format: Markdown",
-            "- AI-friendly structure: each sheet is converted into a markdown table"
-        });
-
         var sharedStringTable = workbookPart.SharedStringTablePart?.SharedStringTable;
+        var worksheetRowsBySheet = new List<(string SheetName, List<List<string>> Rows)>();
+        var sheetExports = new List<SheetExport>();
         var sheetCount = 0;
 
         foreach (var sheet in workbookPart.Workbook.Sheets.OfType<Sheet>())
@@ -138,20 +164,11 @@ static IResult ConvertSpreadsheet(Stream stream, string fileName)
 
             sheetCount++;
             var worksheetPart = (WorksheetPart)workbookPart.GetPartById(relationshipId);
-            var sheetRows = ExtractWorksheetRows(worksheetPart, sharedStringTable);
+            var worksheetRows = ExtractWorksheetRows(worksheetPart, sharedStringTable);
+            var sheetName = NormalizeSheetName(sheet.Name?.Value, sheetCount);
 
-            markdownBuilder.AppendLine($"## Sheet {sheetCount}: {sheet.Name}");
-            markdownBuilder.AppendLine();
-
-            if (sheetRows.Count == 0)
-            {
-                markdownBuilder.AppendLine("_No readable rows were found in this sheet._");
-                markdownBuilder.AppendLine();
-                continue;
-            }
-
-            markdownBuilder.AppendLine(BuildMarkdownTable(sheetRows));
-            markdownBuilder.AppendLine();
+            worksheetRowsBySheet.Add((sheetName, worksheetRows));
+            sheetExports.Add(new SheetExport(sheetName, worksheetRows.Count));
         }
 
         if (sheetCount == 0)
@@ -159,13 +176,42 @@ static IResult ConvertSpreadsheet(Stream stream, string fileName)
             return Results.BadRequest("The workbook did not contain any readable sheets.");
         }
 
+        if (outputFormat == OutputFormat.CsvBundle)
+        {
+            var (archiveBytes, csvSheetExports, preview) = BuildSpreadsheetCsvBundle(fileName, worksheetRowsBySheet);
+
+            return CreateCsvBundleResult(fileName, "Excel workbook", preview, archiveBytes, csvSheetExports);
+        }
+
+        var markdownBuilder = new StringBuilder();
+        AppendConversionHeader(markdownBuilder, fileName, "Excel workbook", new[]
+        {
+            "- Conversion mode: worksheet table extraction",
+            "- Output format: Markdown",
+            "- AI-friendly structure: each sheet is converted into a markdown table"
+        });
+
+        var sheetIndex = 0;
+        foreach (var (sheetName, rows) in worksheetRowsBySheet)
+        {
+            sheetIndex++;
+            markdownBuilder.AppendLine($"## Sheet {sheetIndex}: {sheetName}");
+            markdownBuilder.AppendLine();
+
+            if (rows.Count == 0)
+            {
+                markdownBuilder.AppendLine("_No readable rows were found in this sheet._");
+                markdownBuilder.AppendLine();
+                continue;
+            }
+
+            markdownBuilder.AppendLine(BuildMarkdownTable(rows));
+            markdownBuilder.AppendLine();
+        }
+
         var markdown = markdownBuilder.ToString().TrimEnd();
 
-        return Results.Ok(new
-        {
-            message = "Conversion successful!",
-            markdown
-        });
+        return CreateMarkdownResult(fileName, "Excel workbook", markdown, markdown, sheetExports.ToArray());
     }
     catch (Exception ex)
     {
@@ -177,6 +223,11 @@ static IResult ConvertPresentation(Stream stream, string fileName)
 {
     try
     {
+        if (stream.CanSeek)
+        {
+            stream.Position = 0;
+        }
+
         using var presentationDocument = PresentationDocument.Open(stream, false);
         var presentationPart = presentationDocument.PresentationPart;
         var slideIdList = presentationPart?.Presentation?.SlideIdList;
@@ -228,11 +279,7 @@ static IResult ConvertPresentation(Stream stream, string fileName)
 
         var markdown = markdownBuilder.ToString().TrimEnd();
 
-        return Results.Ok(new
-        {
-            message = "Conversion successful!",
-            markdown
-        });
+        return CreateMarkdownResult(fileName, "PowerPoint presentation", markdown, markdown);
     }
     catch (Exception ex)
     {
@@ -244,12 +291,17 @@ static IResult ConvertPdf(Stream stream, string fileName)
 {
     try
     {
+        if (stream.CanSeek)
+        {
+            stream.Position = 0;
+        }
+
         var markdownBuilder = new StringBuilder();
         using var pdfDocument = PdfDocument.Open(stream);
 
         AppendConversionHeader(markdownBuilder, fileName, "PDF document", new[]
         {
-            "- Conversion mode: page text extraction",
+            "- Conversion mode: page text extraction with paragraph normalization",
             "- Output format: Markdown",
             "- AI-friendly structure: each page becomes a labeled section"
         });
@@ -258,7 +310,7 @@ static IResult ConvertPdf(Stream stream, string fileName)
         foreach (var page in pdfDocument.GetPages())
         {
             pageCount++;
-            var pageText = page.Text.Trim();
+            var pageText = FormatPdfPageText(page.Text);
 
             markdownBuilder.AppendLine($"## Page {pageCount}");
             markdownBuilder.AppendLine();
@@ -281,11 +333,7 @@ static IResult ConvertPdf(Stream stream, string fileName)
 
         var markdown = markdownBuilder.ToString().TrimEnd();
 
-        return Results.Ok(new
-        {
-            message = "Conversion successful!",
-            markdown
-        });
+        return CreateMarkdownResult(fileName, "PDF document", markdown, markdown);
     }
     catch (Exception ex)
     {
@@ -293,7 +341,7 @@ static IResult ConvertPdf(Stream stream, string fileName)
     }
 }
 
-static void AppendConversionHeader(StringBuilder markdownBuilder, string fileName, string formatLabel, IEnumerable<string> summaryLines)
+static void AppendConversionHeader(StringBuilder markdownBuilder, string fileName, string formatLabel, IEnumerable<string> summaryLines, string contentHeading = "Extracted Content")
 {
     markdownBuilder.AppendLine("# DocuMark Conversion Log");
     markdownBuilder.AppendLine();
@@ -309,8 +357,294 @@ static void AppendConversionHeader(StringBuilder markdownBuilder, string fileNam
     markdownBuilder.AppendLine();
     markdownBuilder.AppendLine("---");
     markdownBuilder.AppendLine();
-    markdownBuilder.AppendLine("## Extracted Content");
+    markdownBuilder.AppendLine($"## {contentHeading}");
     markdownBuilder.AppendLine();
+}
+
+static IResult CreateMarkdownResult(string sourceFileName, string inputFormat, string markdown, string preview, SheetExport[]? sheets = null)
+{
+    return Results.Ok(new
+    {
+        message = "Conversion successful!",
+        inputFormat,
+        outputFormat = "markdown",
+        fileName = CreateDownloadFileName(sourceFileName, "md"),
+        contentType = "text/markdown; charset=utf-8",
+        content = markdown,
+        markdown,
+        preview,
+        sheets
+    });
+}
+
+static IResult CreateCsvBundleResult(string sourceFileName, string inputFormat, string preview, byte[] archiveBytes, SheetExport[] sheets)
+{
+    return Results.Ok(new
+    {
+        message = "Conversion successful!",
+        inputFormat,
+        outputFormat = "csv-bundle",
+        fileName = CreateDownloadFileName(sourceFileName, "zip", "csv-bundle"),
+        contentType = "application/zip",
+        content = (string?)null,
+        contentBase64 = Convert.ToBase64String(archiveBytes),
+        preview,
+        sheets
+    });
+}
+
+static OutputFormat ParseRequestedOutputFormat(string? value)
+{
+    return value?.Trim().ToLowerInvariant() switch
+    {
+        "csv" or "csv-bundle" or "csvbundle" or "zip" => OutputFormat.CsvBundle,
+        _ => OutputFormat.Markdown
+    };
+}
+
+static string CreateDownloadFileName(string sourceFileName, string extension, string? suffix = null)
+{
+    var baseName = Path.GetFileNameWithoutExtension(sourceFileName);
+    if (string.IsNullOrWhiteSpace(baseName))
+    {
+        baseName = "output";
+    }
+
+    baseName = SanitizeFileName(baseName);
+
+    return string.IsNullOrWhiteSpace(suffix)
+        ? $"{baseName}.{extension}"
+        : $"{baseName}-{suffix}.{extension}";
+}
+
+static string SanitizeFileName(string value)
+{
+    var invalidCharacters = Path.GetInvalidFileNameChars();
+    var sanitizedBuilder = new StringBuilder(value.Length);
+
+    foreach (var character in value)
+    {
+        sanitizedBuilder.Append(Array.IndexOf(invalidCharacters, character) >= 0 ? '_' : character);
+    }
+
+    var sanitized = sanitizedBuilder.ToString();
+
+    return string.IsNullOrWhiteSpace(sanitized) ? "output" : sanitized.Trim().Trim('.');
+}
+
+static string NormalizeText(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return string.Empty;
+    }
+
+    return Regex.Replace(value, @"\s+", " ").Trim();
+}
+
+static string FormatPdfPageText(string pageText)
+{
+    if (string.IsNullOrWhiteSpace(pageText))
+    {
+        return string.Empty;
+    }
+
+    var paragraphBuilder = new StringBuilder();
+    var paragraphs = new List<string>();
+
+    foreach (var line in pageText.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'))
+    {
+        var normalizedLine = NormalizeText(line);
+
+        if (string.IsNullOrWhiteSpace(normalizedLine))
+        {
+            if (paragraphBuilder.Length > 0)
+            {
+                paragraphs.Add(paragraphBuilder.ToString().Trim());
+                paragraphBuilder.Clear();
+            }
+
+            continue;
+        }
+
+        if (paragraphBuilder.Length > 0)
+        {
+            paragraphBuilder.Append(' ');
+        }
+
+        paragraphBuilder.Append(normalizedLine);
+    }
+
+    if (paragraphBuilder.Length > 0)
+    {
+        paragraphs.Add(paragraphBuilder.ToString().Trim());
+    }
+
+    return string.Join(Environment.NewLine + Environment.NewLine, paragraphs);
+}
+
+static string NormalizeSheetName(string? value, int sheetIndex)
+{
+    var sheetName = NormalizeText(value);
+
+    if (string.IsNullOrWhiteSpace(sheetName))
+    {
+        return $"Sheet {sheetIndex}";
+    }
+
+    return sheetName;
+}
+
+static (byte[] ArchiveBytes, SheetExport[] SheetExports, string Preview) BuildSpreadsheetCsvBundle(string sourceFileName, IReadOnlyList<(string SheetName, List<List<string>> Rows)> sheets)
+{
+    using var archiveStream = new MemoryStream();
+    var previewBuilder = new StringBuilder();
+
+    AppendConversionHeader(previewBuilder, sourceFileName, "Excel workbook", new[]
+    {
+        "- Conversion mode: worksheet export",
+        "- Output format: ZIP archive containing one CSV per sheet",
+        "- Each sheet is exported with RFC 4180 CSV escaping"
+    }, "Exported CSV Files");
+
+    var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var sheetExports = new List<SheetExport>();
+
+    using (var archive = new ZipArchive(archiveStream, ZipArchiveMode.Create, leaveOpen: true))
+    {
+        foreach (var (sheetName, rows) in sheets)
+        {
+            var safeSheetName = SanitizeFileName(sheetName);
+            var csvFileName = EnsureUniqueFileName(safeSheetName, "csv", usedFileNames);
+            var entry = archive.CreateEntry(csvFileName, CompressionLevel.Optimal);
+
+            using (var entryStream = entry.Open())
+            using (var writer = new StreamWriter(entryStream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)))
+            {
+                foreach (var row in rows)
+                {
+                    writer.WriteLine(BuildCsvLine(row));
+                }
+            }
+
+            sheetExports.Add(new SheetExport(sheetName, rows.Count, csvFileName));
+            previewBuilder.AppendLine($"- {sheetName} -> {csvFileName} ({rows.Count} rows)");
+        }
+    }
+
+    return (archiveStream.ToArray(), sheetExports.ToArray(), previewBuilder.ToString().TrimEnd());
+}
+
+static string EnsureUniqueFileName(string baseName, string extension, HashSet<string> usedFileNames)
+{
+    var candidate = $"{baseName}.{extension}";
+    var suffix = 2;
+
+    while (!usedFileNames.Add(candidate))
+    {
+        candidate = $"{baseName}-{suffix++}.{extension}";
+    }
+
+    return candidate;
+}
+
+static string BuildCsvLine(IEnumerable<string> values)
+{
+    return string.Join(",", values.Select(EscapeCsvCell));
+}
+
+static string EscapeCsvCell(string? value)
+{
+    var cellValue = value ?? string.Empty;
+
+    var mustQuote = cellValue.Contains(',') || cellValue.Contains('"') || cellValue.Contains('\n') || cellValue.Contains('\r');
+
+    if (mustQuote)
+    {
+        return $"\"{cellValue.Replace("\"", "\"\"")}\"";
+    }
+
+    return cellValue;
+}
+
+static string RenderWordParagraph(Paragraph paragraph)
+{
+    var text = NormalizeText(paragraph.InnerText);
+
+    if (string.IsNullOrWhiteSpace(text))
+    {
+        return string.Empty;
+    }
+
+    var styleId = paragraph.ParagraphProperties?.ParagraphStyleId?.Val?.Value;
+    var headingLevel = GetHeadingLevel(styleId);
+
+    if (headingLevel > 0)
+    {
+        return $"{new string('#', headingLevel)} {text}";
+    }
+
+    var numberingLevel = paragraph.ParagraphProperties?.NumberingProperties?.NumberingLevelReference?.Val?.Value ?? 0;
+    var isListItem = paragraph.ParagraphProperties?.NumberingProperties != null
+        || (styleId?.Contains("List", StringComparison.OrdinalIgnoreCase) ?? false);
+
+    if (isListItem)
+    {
+        return $"{new string(' ', numberingLevel * 2)}- {text}";
+    }
+
+    return text;
+}
+
+static string ConvertWordTable(DocumentFormat.OpenXml.Wordprocessing.Table table)
+{
+    var rows = new List<List<string>>();
+
+    foreach (var row in table.Elements<TableRow>())
+    {
+        var rowValues = new List<string>();
+
+        foreach (var cell in row.Elements<TableCell>())
+        {
+            rowValues.Add(NormalizeText(cell.InnerText));
+        }
+
+        if (rowValues.Any(value => !string.IsNullOrWhiteSpace(value)))
+        {
+            rows.Add(rowValues);
+        }
+    }
+
+    return BuildMarkdownTable(rows);
+}
+
+static int GetHeadingLevel(string? styleId)
+{
+    if (string.IsNullOrWhiteSpace(styleId))
+    {
+        return 0;
+    }
+
+    if (styleId.Equals("Title", StringComparison.OrdinalIgnoreCase))
+    {
+        return 1;
+    }
+
+    if (styleId.Equals("Subtitle", StringComparison.OrdinalIgnoreCase))
+    {
+        return 2;
+    }
+
+    if (!styleId.StartsWith("Heading", StringComparison.OrdinalIgnoreCase))
+    {
+        return 0;
+    }
+
+    var digits = new string(styleId.Where(char.IsDigit).ToArray());
+
+    return int.TryParse(digits, out var headingLevel)
+        ? Math.Clamp(headingLevel, 1, 6)
+        : 1;
 }
 
 static List<List<string>> ExtractWorksheetRows(WorksheetPart worksheetPart, SharedStringTable? sharedStringTable)
@@ -459,8 +793,48 @@ static int GetColumnIndexFromCellReference(string? cellReference)
 
 static List<string> ExtractSlideText(SlidePart slidePart)
 {
-    return slidePart.Slide.Descendants<A.Paragraph>()
-        .Select(paragraph => paragraph.InnerText.Trim())
-        .Where(text => !string.IsNullOrWhiteSpace(text))
-        .ToList();
+    var slideLines = new List<string>();
+    var slideTitle = string.Empty;
+
+    foreach (var shape in slidePart.Slide.Descendants<A.Shape>())
+    {
+        var textBody = shape.GetFirstChild<A.TextBody>();
+        if (textBody == null)
+        {
+            continue;
+        }
+
+        foreach (var paragraph in textBody.Elements<A.Paragraph>())
+        {
+            var text = NormalizeText(paragraph.InnerText);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(slideTitle))
+            {
+                slideTitle = text;
+                continue;
+            }
+
+            var level = paragraph.ParagraphProperties?.Level?.Value ?? 0;
+            slideLines.Add($"{new string(' ', level * 2)}- {text}");
+        }
+    }
+
+    if (!string.IsNullOrWhiteSpace(slideTitle))
+    {
+        slideLines.Insert(0, slideTitle);
+    }
+
+    return slideLines;
 }
+
+enum OutputFormat
+{
+    Markdown,
+    CsvBundle
+}
+
+record SheetExport(string SheetName, int RowCount, string? FileName = null);

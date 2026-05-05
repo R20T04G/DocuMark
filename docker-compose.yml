@@ -6,6 +6,7 @@ services:
       - "5152:8080" 
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
 
   frontend:
     build:
@@ -13,6 +14,7 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - NODE_ENV=production
       - BACKEND_URL=http://backend:8080
     depends_on:
       - backend
